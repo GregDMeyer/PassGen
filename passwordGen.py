@@ -3,12 +3,12 @@ from Crypto.Random.random import choice, sample
 from string import printable, ascii_lowercase, ascii_letters, digits
 from math import log, ceil, floor
 from os.path import isfile
+from sys import stderr
 
 
 def max_len_exception(max_length,min_length,min_entropy):
-    return Exception("Went over max_length ("+str(max_length) +
-                     ") trying to achieve min_length "+str(min_length) +
-                     " and min_entropy "+str(min_entropy)+".")
+    return Exception("Impossible to achieve min_entropy "+ str(min_entropy) +
+                     " and max_length "+str(max_length)+". Try increasing max_length?")
 
 
 def make_pass(pool='chars',
@@ -30,12 +30,15 @@ def make_pass(pool='chars',
     if min_length > max_length:
         raise Exception('min_length must be <= max_length.')
 
+    # error checking
+    if pool != 'words' and 'word_file' in kwargs:
+        print('Warning: word file supplied but pool not set to words. Ignoring file...',file=stderr)
+
+    # figure out what pool we are using
     if pool == 'chars':
         pool = printable.strip()
-
     elif pool == 'lowercase':
         pool = ascii_lowercase
-
     elif pool == 'alphanumeric':
         pool = ascii_letters + digits
 
@@ -47,10 +50,14 @@ def make_pass(pool='chars',
             word_file = kwargs['word_file']
 
         if not isfile(word_file):
-            raise Exception('\''+word_file+'\' does not exist.')
+            raise Exception('File \''+word_file+'\' does not exist.')
 
         f = open(word_file)
         pool = [word.strip() for word in f.readlines()]
+
+        # set the modification to capitalize first letter of each
+        if mod_fn is None:
+            mod_fn = lambda x: x[0].upper() + x[1:].lower()
 
     elif type(pool) != list:
         raise Exception("Pool must be a list, 'chars', or 'words'.")
@@ -66,7 +73,7 @@ def make_pass(pool='chars',
 
     # filter by the given function
     if filter_fn:
-        pool = {x for n,x in enumerate(pool) if filter_fn(n,x)}
+        pool = {x for x in pool if filter_fn(x)}
         if len(pool) == 0:
             raise Exception("Filter returned False for every element of pool.")
 
@@ -74,67 +81,67 @@ def make_pass(pool='chars',
     if mod_fn:
         pool = set(map(mod_fn, pool))
 
-    ind_entropy = log(len(pool), 2)
-    min_elements = int(ceil(min_entropy/ind_entropy))
+    entropy_per_element = log(len(pool), 2)
 
-    # only need to do this if elements are not length 1
+    # figure out the smallest number of elements needed to achieve the minimum requested entropy
+    min_elements = int(ceil(min_entropy/entropy_per_element))
+
+    # we want a length distribution that stays under max_length but still achieves the entropy needed.
+    # so we drop really long words from the pool, so that the average word length is correct.
+    # this only matters if the strings in pool are multiple characters
     if any([len(x) > 1 for x in pool]):
-
-        avg_req_element_length = float(max_length - len(join_str)*(min_elements - 1)) / min_elements
 
         # figure out distribution of lengths
         len_dist = [0]*(max([len(x) for x in pool]))
         for x in pool:
             len_dist[len(x)-1] += 1
 
-        while True:
-            tot_len = 0
-            n_elements = 0
-            # now figure out the distribution to get the right average
-            for n,val in enumerate(len_dist):
-                if float(tot_len+(n+1)*val)/(n_elements+val) > avg_req_element_length: # average has exceeded our max
-                    break
-                tot_len += (n+1)*val
-                n_elements += val
-
-            # figure out how many we need of that last category to bring the average up to what we want
-            n_last = int(((avg_req_element_length - float(tot_len/n_elements))/(n+1 - avg_req_element_length)) * n_elements)
-
-            if n+1 == len(len_dist) and n_last > len_dist[n]: # then we are using everything. no need to trim
-                n_last = len_dist[n]
-
-            # new pool size
-            pool_size = n_elements + n_last
-
-            ind_entropy = log(pool_size,2)
-            if min_elements == int(ceil(min_entropy/ind_entropy)): # don't need to recalculate
+        for n,freq in enumerate(len_dist):
+            element_length = n+1 # zero indexed...
+            average_length = sum(((np+1)*freqp for np,freqp in enumerate(len_dist[:n+1]))) / sum((x+1 for x in len_dist[:n+1]))
+            entropy_per_element = log(sum((x+1 for x in len_dist[:n+1])),2)
+            if float(max_length)/average_length * entropy_per_element < min_entropy:
+                if sum((x+1 for x in len_dist[:n])) == 0: # started below the min_entropy :(
+                    raise max_len_exception(max_length, min_length, min_entropy)
                 break
-            min_elements = int(ceil(min_entropy/ind_entropy))
 
-        pool = {x for x in pool if len(x) < n+1} | set( sample([x for x in pool if len(x) == n+1], n_last))
+        max_element_size = n
+
+        # now generate the final pool we want.
+        # it is everything with length less than or equal to element_size (which is now the max value we would want)
+        # could also add some from the last group with length equal to element_size? need to calculate n_last
+        pool = {x for x in pool if len(x) < max_element_size+1} # | set( sample([x for x in pool if len(x) == max_element_size+1], n_last))
+        
+        # recalculate these values
+        entropy_per_element = log(sum((x+1 for x in len_dist[:n])),2)
+        min_elements = int(ceil(min_entropy/entropy_per_element))
+
+    # make sure it is at least possible to achieve the entropy we want, while keeping it under max_length
+    if min_elements*min([len(x) for x in pool]) > max_length:
+        raise max_len_exception(max_length, min_length, min_entropy)
 
     # need to switch back to a list for the random module
     pool = list(pool)
 
-    # no reason to limit entropy by not allowing repeats
+    # no reason to limit entropy by not allowing repeats, so use choice instead of sample
     element_lst = [choice(pool) for i in range(min_elements)]
+
     # we might get unlucky and have it too long. keep trying until we don't
-    # this reduces the entropy a bit. But I think it's not too bad
+    # this reduces the entropy a small bit, since we are rejecting some possibilities.
+    # but calculating the true entropy is annoying so... sorry
     while len(join_str.join(element_lst)) > max_length:
-        print('Redoing... too long')
+        print('Redoing... too long. Entropy slightly less than advertised.\nMaybe try increasing max_length, or using a word list with shorter words.')
         element_lst = [choice(pool) for i in range(min_elements)]
 
+    # if we are below min_length still, add elements until we get there
     while len(join_str.join(element_lst)) < min_length:
         element_lst += [choice(pool)]
-
-    if len(join_str.join(element_lst)) > max_length:
-        raise max_len_exception(max_length, min_length, min_entropy)
 
     if verbose:
         print('Password: ', join_str.join(element_lst),'\n')
         if any([len(x) > 1 for x in pool]):
-            print('Average pool element length: ', float(sum([len(x) for x in pool]))/len(pool))
-        print('Bits entropy: ', ind_entropy*len(element_lst))
+            print('Average word length: ', '{:.2f}'.format(float(sum([len(x) for x in pool]))/len(pool)))
+        print('Bits entropy: ', '{:.2f}'.format(entropy_per_element*len(element_lst)))
         print('Length: ', len(join_str.join(element_lst)))
         print('N. elements: ', len(element_lst))
 
